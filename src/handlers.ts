@@ -616,25 +616,58 @@ export function registerHandlers(io: ServerIO) {
           .eq('id', id)
           .single();
         if (!msg) return;
-        if (auth.role !== 'admin') {
-          if (msg.sender_id !== auth.userId) return;
+
+        const isSender = msg.sender_id === auth.userId;
+        const isPlatformAdmin = auth.role === 'admin';
+        let isGroupAdmin = false;
+        if (!isSender && !isPlatformAdmin) {
+          const { data: convRow } = await supabaseAdmin
+            .from('conversations')
+            .select('is_group')
+            .eq('id', msg.conversation_id)
+            .maybeSingle();
+          if (convRow?.is_group) {
+            const { data: meMember } = await supabaseAdmin
+              .from('conversation_participants')
+              .select('is_admin, left_at')
+              .eq('conversation_id', msg.conversation_id)
+              .eq('user_id', auth.userId)
+              .maybeSingle();
+            isGroupAdmin = !!meMember?.is_admin && !meMember?.left_at;
+          }
+        }
+
+        if (!isSender && !isPlatformAdmin && !isGroupAdmin) return;
+
+        if (isSender && !isPlatformAdmin) {
           const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
           if (new Date(msg.timestamp) < oneHourAgo) return;
         }
 
         await supabaseAdmin
           .from('messages')
-          .update({ is_deleted: true, content: '', audio_url: null })
+          .update({
+            is_deleted: true,
+            content: '',
+            audio_url: null,
+            deleted_by: auth.userId,
+          })
           .eq('id', id);
+
+        const deletePayload = {
+          id,
+          conversationId: msg.conversation_id,
+          deletedBy: auth.userId,
+          deletedByUsername: auth.username,
+          deletedByAdmin: isGroupAdmin || (isPlatformAdmin && !isSender),
+        };
 
         if (await conversationIsGroup(msg.conversation_id)) {
           const targets = await activeGroupUsernames(msg.conversation_id);
-          targets.forEach((uname) =>
-            io.to(USER_ROOM(uname)).emit('delete-message', { id, conversationId: msg.conversation_id }),
-          );
+          targets.forEach((uname) => io.to(USER_ROOM(uname)).emit('delete-message', deletePayload));
         } else if (typeof to === 'string') {
-          io.to(USER_ROOM(to)).emit('delete-message', { id });
-          io.to(USER_ROOM(auth.username)).emit('delete-message', { id });
+          io.to(USER_ROOM(to)).emit('delete-message', deletePayload);
+          io.to(USER_ROOM(auth.username)).emit('delete-message', deletePayload);
         }
       } catch (error) {
         console.error('[socket] delete-message error:', error);
