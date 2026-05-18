@@ -5,6 +5,7 @@ exports.registerHandlers = registerHandlers;
 const auth_js_1 = require("./auth.js");
 const supabase_js_1 = require("./supabase.js");
 const push_js_1 = require("./push.js");
+const web_push_js_1 = require("./web-push.js");
 function previewForMessage(data) {
     if (data?.isVoiceMessage)
         return '🎤 Voice message';
@@ -78,14 +79,82 @@ function buildCallPreview(callType, callStatus, durationSec) {
         return `Canceled ${kind} call`;
     return `${kind === 'video' ? 'Video' : 'Voice'} call`;
 }
+async function usernameForId(userId) {
+    const { data } = await supabase_js_1.supabaseAdmin
+        .from('users')
+        .select('username')
+        .eq('id', userId)
+        .maybeSingle();
+    return data?.username || null;
+}
+async function activeGroupUsernames(conversationId) {
+    const { data: parts } = await supabase_js_1.supabaseAdmin
+        .from('conversation_participants')
+        .select('left_at, users:users(username)')
+        .eq('conversation_id', conversationId);
+    return (parts || [])
+        .filter((p) => !p.left_at && p.users?.username)
+        .map((p) => p.users.username);
+}
+async function conversationIsGroup(conversationId) {
+    const { data } = await supabase_js_1.supabaseAdmin
+        .from('conversations')
+        .select('is_group')
+        .eq('id', conversationId)
+        .maybeSingle();
+    return !!data?.is_group;
+}
+async function computeAndApplyAggregate(messageId) {
+    const { data: msg } = await supabase_js_1.supabaseAdmin
+        .from('messages')
+        .select('id, conversation_id, sender_id, status, timestamp')
+        .eq('id', messageId)
+        .maybeSingle();
+    if (!msg)
+        return null;
+    const { data: parts } = await supabase_js_1.supabaseAdmin
+        .from('conversation_participants')
+        .select('user_id, left_at, joined_at')
+        .eq('conversation_id', msg.conversation_id);
+    const sentAt = msg.timestamp ? new Date(msg.timestamp).getTime() : 0;
+    const recipients = (parts || []).filter((p) => p.user_id !== msg.sender_id &&
+        (!p.left_at || new Date(p.left_at).getTime() > sentAt) &&
+        (!p.joined_at || new Date(p.joined_at).getTime() <= sentAt));
+    if (!recipients.length) {
+        return { status: msg.status || 'sent', changed: false };
+    }
+    const recipientIds = recipients.map((r) => r.user_id);
+    const { data: receipts } = await supabase_js_1.supabaseAdmin
+        .from('message_receipts')
+        .select('user_id, delivered_at, read_at')
+        .eq('message_id', messageId)
+        .in('user_id', recipientIds);
+    const byUser = new Map();
+    (receipts || []).forEach((r) => byUser.set(r.user_id, { delivered_at: r.delivered_at, read_at: r.read_at }));
+    const allDelivered = recipientIds.every((uid) => !!byUser.get(uid)?.delivered_at);
+    const allRead = recipientIds.every((uid) => !!byUser.get(uid)?.read_at);
+    const next = allRead
+        ? 'read'
+        : allDelivered
+            ? 'delivered'
+            : 'sent';
+    if (next === msg.status)
+        return { status: next, changed: false };
+    await supabase_js_1.supabaseAdmin.from('messages').update({ status: next }).eq('id', messageId);
+    return { status: next, changed: true };
+}
 async function isParticipant(userId, conversationId) {
     const { data } = await supabase_js_1.supabaseAdmin
         .from('conversation_participants')
-        .select('user_id')
+        .select('user_id, left_at')
         .eq('conversation_id', conversationId)
         .eq('user_id', userId)
         .maybeSingle();
-    return !!data;
+    if (!data)
+        return false;
+    if (data.left_at)
+        return false;
+    return true;
 }
 async function getOrCreateConversation(fromUserId, toUserId) {
     if (fromUserId === toUserId) {
@@ -143,8 +212,6 @@ async function getOrCreateConversation(fromUserId, toUserId) {
             .filter(([, c]) => c === 2)
             .map(([id]) => id);
         if (sharedIds.length) {
-            // Only reuse a regular (user-mode) thread here. Admin-mode threads are
-            // owned by the admin send-as-admin flow and stay separate.
             const { data: userThread } = await supabase_js_1.supabaseAdmin
                 .from('conversations')
                 .select('id')
@@ -179,13 +246,28 @@ async function buildConversationPayload(conversationId) {
         return null;
     const { data: partRows } = await supabase_js_1.supabaseAdmin
         .from('conversation_participants')
-        .select('user_id')
+        .select('user_id, is_admin, joined_at, left_at')
         .eq('conversation_id', conversationId);
-    const userIds = (partRows || []).map((p) => p.user_id);
+    const rows = partRows || [];
+    const userIds = rows.map((p) => p.user_id);
     const { data: usersData } = userIds.length
         ? await supabase_js_1.supabaseAdmin.from('users').select('id, username, avatar').in('id', userIds)
         : { data: [] };
-    const participants = (usersData || []).map((u) => ({ user: u }));
+    const usersById = new Map();
+    (usersData || []).forEach((u) => usersById.set(u.id, u));
+    const participants = rows
+        .map((r) => {
+        const u = usersById.get(r.user_id);
+        if (!u)
+            return null;
+        return {
+            user: u,
+            isAdmin: !!r.is_admin,
+            joinedAt: r.joined_at,
+            leftAt: r.left_at ?? null,
+        };
+    })
+        .filter((x) => !!x);
     const { data: lastMsg } = await supabase_js_1.supabaseAdmin
         .from('messages')
         .select('*, sender:users(id, username, avatar)')
@@ -199,6 +281,11 @@ async function buildConversationPayload(conversationId) {
         isGroup: conv.is_group,
         isAdminThread: !!conv.is_admin_thread,
         adminId: conv.admin_id || null,
+        avatar: conv.avatar || null,
+        about: conv.about || null,
+        onlyAdminCanSend: !!conv.only_admin_can_send,
+        onlyAdminCanAddMembers: !!conv.only_admin_can_add_members,
+        createdBy: conv.created_by || null,
         createdAt: conv.created_at,
         updatedAt: conv.updated_at,
         participants,
@@ -215,9 +302,6 @@ async function buildConversationPayload(conversationId) {
     };
 }
 function registerHandlers(io) {
-    // Authenticate every socket connection from the access-token cookie /
-    // Authorization header. Reject the handshake if the token is missing,
-    // expired, or the user is disabled.
     io.use(async (socket, next) => {
         try {
             const auth = await (0, auth_js_1.authenticateSocket)(socket);
@@ -237,8 +321,6 @@ function registerHandlers(io) {
             next(new Error('UNAUTHORIZED'));
         }
     });
-    // Reject events that try to spoof the sender. The socket's identity comes
-    // from the verified JWT, not from the client payload.
     const isSenderValid = (socket, claimedFrom) => {
         if (!socket.data.auth)
             return false;
@@ -250,8 +332,6 @@ function registerHandlers(io) {
     io.on('connection', (rawSocket) => {
         const socket = rawSocket;
         const auth = socket.data.auth;
-        // Auto-join the per-user room. Multi-tab/multi-device users get one
-        // logical destination, no manual socket-id bookkeeping required.
         socket.join((0, exports.USER_ROOM)(auth.username));
         userOnline(auth.username);
         io.emit('joined', onlineMapForClient());
@@ -281,9 +361,9 @@ function registerHandlers(io) {
                 return;
             }
             const { to, from, message, id, timestamp, status, isVoiceMessage, audioUrl, audioDuration, } = data || {};
-            if (!to || !from) {
+            if (!from) {
                 if (callback)
-                    callback({ status: 'error', message: 'Missing recipient or sender' });
+                    callback({ status: 'error', message: 'Missing sender' });
                 return;
             }
             if (!isSenderValid(socket, from)) {
@@ -296,14 +376,38 @@ function registerHandlers(io) {
                     callback({ status: 'error', message: 'Message too long' });
                 return;
             }
-            const cleanTo = String(to).trim();
             const cleanFrom = String(from).trim();
+            const rawTo = typeof to === 'string' ? to.trim() : '';
+            const isGroupPlaceholder = rawTo.startsWith('__group:');
+            const cleanTo = isGroupPlaceholder ? '' : rawTo;
+            const clientConvIdRaw = data.conversation_id || data.conversationId;
+            if (!cleanTo && !clientConvIdRaw) {
+                if (callback)
+                    callback({ status: 'error', message: 'Missing recipient or conversation' });
+                return;
+            }
             try {
-                const [{ data: fromUser }, { data: toUser }] = await Promise.all([
-                    supabase_js_1.supabaseAdmin.from('users').select('id').eq('username', cleanFrom).single(),
-                    supabase_js_1.supabaseAdmin.from('users').select('id').eq('username', cleanTo).single(),
-                ]);
-                if (!fromUser || !toUser) {
+                const fromUserRes = await supabase_js_1.supabaseAdmin
+                    .from('users')
+                    .select('id')
+                    .eq('username', cleanFrom)
+                    .single();
+                const fromUser = fromUserRes.data;
+                let toUser = null;
+                if (cleanTo) {
+                    const toUserRes = await supabase_js_1.supabaseAdmin
+                        .from('users')
+                        .select('id')
+                        .eq('username', cleanTo)
+                        .single();
+                    toUser = toUserRes.data;
+                }
+                if (!fromUser) {
+                    if (callback)
+                        callback({ status: 'error', message: 'User not found' });
+                    return;
+                }
+                if (cleanTo && !toUser) {
                     if (callback)
                         callback({ status: 'error', message: 'User not found' });
                     return;
@@ -313,13 +417,14 @@ function registerHandlers(io) {
                         callback({ status: 'error', message: 'Sender mismatch' });
                     return;
                 }
-                const clientConvId = data.conversation_id || data.conversationId;
+                const clientConvId = clientConvIdRaw;
                 let convId;
                 let createdNew = false;
+                let convRow = null;
                 if (clientConvId) {
                     const { data: existing } = await supabase_js_1.supabaseAdmin
                         .from('conversations')
-                        .select('id')
+                        .select('id, is_group, only_admin_can_send')
                         .eq('id', clientConvId)
                         .maybeSingle();
                     if (!existing) {
@@ -333,8 +438,14 @@ function registerHandlers(io) {
                         return;
                     }
                     convId = existing.id;
+                    convRow = existing;
                 }
                 else {
+                    if (!toUser) {
+                        if (callback)
+                            callback({ status: 'error', message: 'Conversation required' });
+                        return;
+                    }
                     const convResult = await getOrCreateConversation(fromUser.id, toUser.id);
                     if (!convResult) {
                         if (callback)
@@ -343,6 +454,19 @@ function registerHandlers(io) {
                     }
                     convId = convResult.id;
                     createdNew = convResult.wasCreated;
+                }
+                if (convRow?.is_group && convRow.only_admin_can_send) {
+                    const { data: senderMember } = await supabase_js_1.supabaseAdmin
+                        .from('conversation_participants')
+                        .select('is_admin, left_at')
+                        .eq('conversation_id', convId)
+                        .eq('user_id', fromUser.id)
+                        .maybeSingle();
+                    if (!senderMember || senderMember.left_at || !senderMember.is_admin) {
+                        if (callback)
+                            callback({ status: 'error', message: 'Only admins can send messages in this group' });
+                        return;
+                    }
                 }
                 await supabase_js_1.supabaseAdmin.from('messages').upsert({
                     id,
@@ -364,23 +488,39 @@ function registerHandlers(io) {
                     total_chunks: data.totalChunks ?? null,
                 }, { onConflict: 'id' });
                 const enriched = { ...data, conversation_id: convId, conversationId: convId };
+                const { data: convParticipants } = await supabase_js_1.supabaseAdmin
+                    .from('conversation_participants')
+                    .select('user_id, left_at, users:users(id, username)')
+                    .eq('conversation_id', convId);
+                const activeUsernames = (convParticipants || [])
+                    .filter((p) => !p.left_at && p.users?.username)
+                    .map((p) => p.users.username);
                 if (createdNew) {
                     const convPayload = await buildConversationPayload(convId);
                     if (convPayload) {
-                        io.to((0, exports.USER_ROOM)(cleanTo)).emit('new-conversation', convPayload);
-                        if (cleanFrom !== cleanTo) {
-                            io.to((0, exports.USER_ROOM)(cleanFrom)).emit('new-conversation', convPayload);
-                        }
+                        const recipients = activeUsernames.length
+                            ? activeUsernames
+                            : Array.from(new Set([cleanTo, cleanFrom]));
+                        recipients.forEach((uname) => {
+                            io.to((0, exports.USER_ROOM)(uname)).emit('new-conversation', convPayload);
+                        });
                     }
                 }
-                const recipientOnline = (0, exports.isUserConnected)(cleanTo);
-                if (recipientOnline) {
-                    io.to((0, exports.USER_ROOM)(cleanTo)).emit('receive-message', enriched);
+                const recipientOnline = cleanTo ? (0, exports.isUserConnected)(cleanTo) : false;
+                if (convRow?.is_group) {
+                    activeUsernames.forEach((uname) => {
+                        io.to((0, exports.USER_ROOM)(uname)).emit('receive-message', enriched);
+                    });
                 }
-                if (cleanFrom !== cleanTo) {
-                    io.to((0, exports.USER_ROOM)(cleanFrom)).emit('receive-message', enriched);
+                else {
+                    if (recipientOnline) {
+                        io.to((0, exports.USER_ROOM)(cleanTo)).emit('receive-message', enriched);
+                    }
+                    if (cleanFrom !== cleanTo) {
+                        io.to((0, exports.USER_ROOM)(cleanFrom)).emit('receive-message', enriched);
+                    }
                 }
-                if (!recipientOnline && cleanFrom !== cleanTo) {
+                if (!convRow?.is_group && toUser && !recipientOnline && cleanFrom !== cleanTo) {
                     void (0, push_js_1.pushToUser)(toUser.id, {
                         title: cleanFrom,
                         body: previewForMessage(data),
@@ -426,30 +566,66 @@ function registerHandlers(io) {
             try {
                 const { data: msg } = await supabase_js_1.supabaseAdmin
                     .from('messages')
-                    .select('timestamp, sender_id')
+                    .select('timestamp, sender_id, conversation_id')
                     .eq('id', id)
                     .single();
                 if (!msg)
                     return;
-                if (auth.role !== 'admin') {
-                    if (msg.sender_id !== auth.userId)
-                        return;
+                const isSender = msg.sender_id === auth.userId;
+                const isPlatformAdmin = auth.role === 'admin';
+                let isGroupAdmin = false;
+                if (!isSender && !isPlatformAdmin) {
+                    const { data: convRow } = await supabase_js_1.supabaseAdmin
+                        .from('conversations')
+                        .select('is_group')
+                        .eq('id', msg.conversation_id)
+                        .maybeSingle();
+                    if (convRow?.is_group) {
+                        const { data: meMember } = await supabase_js_1.supabaseAdmin
+                            .from('conversation_participants')
+                            .select('is_admin, left_at')
+                            .eq('conversation_id', msg.conversation_id)
+                            .eq('user_id', auth.userId)
+                            .maybeSingle();
+                        isGroupAdmin = !!meMember?.is_admin && !meMember?.left_at;
+                    }
+                }
+                if (!isSender && !isPlatformAdmin && !isGroupAdmin)
+                    return;
+                if (isSender && !isPlatformAdmin) {
                     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
                     if (new Date(msg.timestamp) < oneHourAgo)
                         return;
                 }
                 await supabase_js_1.supabaseAdmin
                     .from('messages')
-                    .update({ is_deleted: true, content: '', audio_url: null })
+                    .update({
+                    is_deleted: true,
+                    content: '',
+                    audio_url: null,
+                    deleted_by: auth.userId,
+                })
                     .eq('id', id);
-                if (typeof to === 'string')
-                    io.to((0, exports.USER_ROOM)(to)).emit('delete-message', { id });
+                const deletePayload = {
+                    id,
+                    conversationId: msg.conversation_id,
+                    deletedBy: auth.userId,
+                    deletedByUsername: auth.username,
+                    deletedByAdmin: isGroupAdmin || (isPlatformAdmin && !isSender),
+                };
+                if (await conversationIsGroup(msg.conversation_id)) {
+                    const targets = await activeGroupUsernames(msg.conversation_id);
+                    targets.forEach((uname) => io.to((0, exports.USER_ROOM)(uname)).emit('delete-message', deletePayload));
+                }
+                else if (typeof to === 'string') {
+                    io.to((0, exports.USER_ROOM)(to)).emit('delete-message', deletePayload);
+                    io.to((0, exports.USER_ROOM)(auth.username)).emit('delete-message', deletePayload);
+                }
             }
             catch (error) {
                 console.error('[socket] delete-message error:', error);
             }
         });
-        /* ─── WebRTC signalling ─────────────────────────────────────────── */
         socket.on('offer', (payload) => {
             if (!limit(socket, 'offer', 30, 10_000))
                 return;
@@ -468,20 +644,38 @@ function registerHandlers(io) {
                         .maybeSingle();
                     if (!callee?.id)
                         return;
-                    await (0, push_js_1.pushToUser)(callee.id, {
-                        title: `Incoming ${callType === 'video' ? 'video' : 'voice'} call`,
-                        body: payload.from,
-                        sound: 'default',
-                        channelId: 'calls',
-                        priority: 'high',
-                        ttl: 30,
-                        data: {
-                            type: 'call',
-                            callType,
-                            from: payload.from,
-                            to: payload.to,
-                        },
-                    });
+                    // Fan out to BOTH transports — native (Expo) and browser PWA
+                    // (Web Push). If the user is on multiple device classes (e.g.
+                    // phone + laptop PWA), each picks up the appropriate ring.
+                    await Promise.all([
+                        (0, push_js_1.pushToUser)(callee.id, {
+                            title: `Incoming ${callType === 'video' ? 'video' : 'voice'} call`,
+                            body: payload.from,
+                            sound: 'default',
+                            channelId: 'calls',
+                            priority: 'high',
+                            ttl: 30,
+                            data: {
+                                type: 'call',
+                                callType,
+                                from: payload.from,
+                                to: payload.to,
+                            },
+                        }),
+                        (0, web_push_js_1.sendWebPushToUser)(callee.id, {
+                            kind: 'call-incoming',
+                            title: `Incoming ${callType === 'video' ? 'video' : 'voice'} call`,
+                            body: `${payload.from} is calling…`,
+                            tag: `call-incoming:${payload.from}`,
+                            requireInteraction: true,
+                            ttl: 30,
+                            data: {
+                                peer: payload.from,
+                                callType,
+                                conversationId: payload.conversationId ?? null,
+                            },
+                        }),
+                    ]);
                 }
                 catch (e) {
                     console.error('[socket] call push failed:', e);
@@ -567,16 +761,51 @@ function registerHandlers(io) {
             if (payload?.to)
                 io.to((0, exports.USER_ROOM)(payload.to)).emit('mute-status', payload);
         });
-        socket.on('typing', (payload) => {
+        socket.on('typing', async (payload) => {
             if (!limit(socket, 'typing', 60, 10_000))
                 return;
-            if (!payload?.to || !payload?.from)
+            if (!payload?.from)
                 return;
             if (!isSenderValid(socket, payload.from))
                 return;
-            io.to((0, exports.USER_ROOM)(payload.to)).emit('typing', {
+            const convIdRaw = payload.conversationId;
+            const targetRaw = typeof payload.to === 'string' ? payload.to.trim() : '';
+            const isGroupTarget = targetRaw.startsWith('__group:');
+            const convId = typeof convIdRaw === 'string' && convIdRaw ? convIdRaw : null;
+            if (convId && (isGroupTarget || !targetRaw)) {
+                try {
+                    const { data: conv } = await supabase_js_1.supabaseAdmin
+                        .from('conversations')
+                        .select('is_group')
+                        .eq('id', convId)
+                        .maybeSingle();
+                    if (conv?.is_group) {
+                        const { data: parts } = await supabase_js_1.supabaseAdmin
+                            .from('conversation_participants')
+                            .select('left_at, users:users(username)')
+                            .eq('conversation_id', convId);
+                        const targets = (parts || [])
+                            .filter((p) => !p.left_at && p.users?.username && p.users.username !== payload.from)
+                            .map((p) => p.users.username);
+                        targets.forEach((uname) => {
+                            io.to((0, exports.USER_ROOM)(uname)).emit('typing', {
+                                from: payload.from,
+                                conversationId: convId,
+                                isTyping: !!payload.isTyping,
+                            });
+                        });
+                        return;
+                    }
+                }
+                catch (e) {
+                    console.error('[socket] typing fanout failed:', e);
+                }
+            }
+            if (!targetRaw)
+                return;
+            io.to((0, exports.USER_ROOM)(targetRaw)).emit('typing', {
                 from: payload.from,
-                conversationId: payload.conversationId,
+                conversationId: convId,
                 isTyping: !!payload.isTyping,
             });
         });
@@ -686,9 +915,30 @@ function registerHandlers(io) {
                     return;
                 if (!(await isParticipant(auth.userId, msg.conversation_id)))
                     return;
-                await supabase_js_1.supabaseAdmin.from('messages').update({ status: 'delivered' }).eq('id', messageId);
-                if (typeof to === 'string') {
-                    io.to((0, exports.USER_ROOM)(to)).emit('message-status-update', { messageId, status: 'delivered' });
+                const { data: conv } = await supabase_js_1.supabaseAdmin
+                    .from('conversations')
+                    .select('is_group')
+                    .eq('id', msg.conversation_id)
+                    .maybeSingle();
+                if (conv?.is_group) {
+                    const now = new Date().toISOString();
+                    await supabase_js_1.supabaseAdmin.from('message_receipts').upsert({ message_id: messageId, user_id: auth.userId, delivered_at: now }, { onConflict: 'message_id,user_id', ignoreDuplicates: false });
+                    const next = await computeAndApplyAggregate(messageId);
+                    if (next?.changed) {
+                        const senderUsername = await usernameForId(msg.sender_id);
+                        if (senderUsername) {
+                            io.to((0, exports.USER_ROOM)(senderUsername)).emit('message-status-update', {
+                                messageId,
+                                status: next.status,
+                            });
+                        }
+                    }
+                }
+                else {
+                    await supabase_js_1.supabaseAdmin.from('messages').update({ status: 'delivered' }).eq('id', messageId);
+                    if (typeof to === 'string') {
+                        io.to((0, exports.USER_ROOM)(to)).emit('message-status-update', { messageId, status: 'delivered' });
+                    }
                 }
             }
             catch (e) {
@@ -710,9 +960,30 @@ function registerHandlers(io) {
                     return;
                 if (!(await isParticipant(auth.userId, msg.conversation_id)))
                     return;
-                await supabase_js_1.supabaseAdmin.from('messages').update({ status: 'read' }).eq('id', messageId);
-                if (typeof to === 'string') {
-                    io.to((0, exports.USER_ROOM)(to)).emit('message-status-update', { messageId, status: 'read' });
+                const { data: conv } = await supabase_js_1.supabaseAdmin
+                    .from('conversations')
+                    .select('is_group')
+                    .eq('id', msg.conversation_id)
+                    .maybeSingle();
+                if (conv?.is_group) {
+                    const now = new Date().toISOString();
+                    await supabase_js_1.supabaseAdmin.from('message_receipts').upsert({ message_id: messageId, user_id: auth.userId, delivered_at: now, read_at: now }, { onConflict: 'message_id,user_id', ignoreDuplicates: false });
+                    const next = await computeAndApplyAggregate(messageId);
+                    if (next?.changed) {
+                        const senderUsername = await usernameForId(msg.sender_id);
+                        if (senderUsername) {
+                            io.to((0, exports.USER_ROOM)(senderUsername)).emit('message-status-update', {
+                                messageId,
+                                status: next.status,
+                            });
+                        }
+                    }
+                }
+                else {
+                    await supabase_js_1.supabaseAdmin.from('messages').update({ status: 'read' }).eq('id', messageId);
+                    if (typeof to === 'string') {
+                        io.to((0, exports.USER_ROOM)(to)).emit('message-status-update', { messageId, status: 'read' });
+                    }
                 }
             }
             catch (e) {
@@ -723,20 +994,31 @@ function registerHandlers(io) {
             if (!limit(socket, 'edit-message', 30, 10_000))
                 return;
             try {
-                if (!id || !to)
+                if (!id)
                     return;
                 if (typeof message === 'string' && message.length > MAX_MESSAGE_LENGTH)
                     return;
                 const { data: msg } = await supabase_js_1.supabaseAdmin
                     .from('messages')
-                    .select('sender_id')
+                    .select('sender_id, conversation_id')
                     .eq('id', id)
                     .maybeSingle();
                 if (!msg)
                     return;
                 if (msg.sender_id !== auth.userId && auth.role !== 'admin')
                     return;
-                io.to((0, exports.USER_ROOM)(String(to))).emit('message-edited', { id, message });
+                if (await conversationIsGroup(msg.conversation_id)) {
+                    const targets = await activeGroupUsernames(msg.conversation_id);
+                    targets.forEach((uname) => io.to((0, exports.USER_ROOM)(uname)).emit('message-edited', {
+                        id,
+                        message,
+                        conversationId: msg.conversation_id,
+                    }));
+                }
+                else if (typeof to === 'string' && to) {
+                    io.to((0, exports.USER_ROOM)(String(to))).emit('message-edited', { id, message });
+                    io.to((0, exports.USER_ROOM)(auth.username)).emit('message-edited', { id, message });
+                }
             }
             catch (e) {
                 console.error('[socket] edit-message failed:', e);
@@ -756,8 +1038,17 @@ function registerHandlers(io) {
                 if (auth.role !== 'admin' && !(await isParticipant(auth.userId, msg.conversation_id)))
                     return;
                 await supabase_js_1.supabaseAdmin.from('messages').update({ is_pinned: !!isPinned }).eq('id', id);
-                if (typeof to === 'string') {
+                if (await conversationIsGroup(msg.conversation_id)) {
+                    const targets = await activeGroupUsernames(msg.conversation_id);
+                    targets.forEach((uname) => io.to((0, exports.USER_ROOM)(uname)).emit('pin-message', {
+                        id,
+                        isPinned,
+                        conversationId: msg.conversation_id,
+                    }));
+                }
+                else if (typeof to === 'string') {
                     io.to((0, exports.USER_ROOM)(to)).emit('pin-message', { id, isPinned });
+                    io.to((0, exports.USER_ROOM)(auth.username)).emit('pin-message', { id, isPinned });
                 }
             }
             catch (e) {
@@ -800,31 +1091,30 @@ function registerHandlers(io) {
                 }
                 await supabase_js_1.supabaseAdmin.from('messages').update({ reactions: current }).eq('id', id);
                 socket.emit('message-reacted', { id, reactions: current });
-                const cleanTo = typeof to === 'string' ? to.trim() : '';
-                if (cleanTo) {
-                    const messagePreview = previewForStoredMessage(msg);
-                    const recipientIsMessageOwner = !!msg.sender_id && msg.sender_id !== auth.userId;
-                    io.to((0, exports.USER_ROOM)(cleanTo)).emit('message-reacted', {
-                        id,
-                        reactions: current,
-                        from: auth.username,
-                        emoji,
-                        removed,
-                        conversationId: msg.conversation_id,
-                        messagePreview,
-                        ownerIsRecipient: recipientIsMessageOwner,
-                    });
-                    if (!removed && recipientIsMessageOwner && !(0, exports.isUserConnected)(cleanTo)) {
-                        const { data: toUser } = await supabase_js_1.supabaseAdmin
-                            .from('users')
-                            .select('id')
-                            .eq('username', cleanTo)
-                            .maybeSingle();
-                        if (toUser?.id) {
+                const messagePreview = previewForStoredMessage(msg);
+                const recipientIsMessageOwner = !!msg.sender_id && msg.sender_id !== auth.userId;
+                const broadcast = {
+                    id,
+                    reactions: current,
+                    from: auth.username,
+                    emoji,
+                    removed,
+                    conversationId: msg.conversation_id,
+                    messagePreview,
+                    ownerIsRecipient: recipientIsMessageOwner,
+                };
+                if (await conversationIsGroup(msg.conversation_id)) {
+                    const targets = await activeGroupUsernames(msg.conversation_id);
+                    targets
+                        .filter((uname) => uname !== auth.username)
+                        .forEach((uname) => io.to((0, exports.USER_ROOM)(uname)).emit('message-reacted', broadcast));
+                    if (!removed && recipientIsMessageOwner) {
+                        const ownerUsername = await usernameForId(msg.sender_id);
+                        if (ownerUsername && !(0, exports.isUserConnected)(ownerUsername)) {
                             const body = messagePreview
                                 ? `Reacted ${emoji} to: ${messagePreview}`
                                 : `Reacted ${emoji} to your message`;
-                            void (0, push_js_1.pushToUser)(toUser.id, {
+                            void (0, push_js_1.pushToUser)(msg.sender_id, {
                                 title: auth.username,
                                 body,
                                 sound: 'default',
@@ -838,6 +1128,38 @@ function registerHandlers(io) {
                                     from: auth.username,
                                 },
                             });
+                        }
+                    }
+                }
+                else {
+                    const cleanTo = typeof to === 'string' ? to.trim() : '';
+                    if (cleanTo) {
+                        io.to((0, exports.USER_ROOM)(cleanTo)).emit('message-reacted', broadcast);
+                        if (!removed && recipientIsMessageOwner && !(0, exports.isUserConnected)(cleanTo)) {
+                            const { data: toUser } = await supabase_js_1.supabaseAdmin
+                                .from('users')
+                                .select('id')
+                                .eq('username', cleanTo)
+                                .maybeSingle();
+                            if (toUser?.id) {
+                                const body = messagePreview
+                                    ? `Reacted ${emoji} to: ${messagePreview}`
+                                    : `Reacted ${emoji} to your message`;
+                                void (0, push_js_1.pushToUser)(toUser.id, {
+                                    title: auth.username,
+                                    body,
+                                    sound: 'default',
+                                    channelId: 'default',
+                                    priority: 'high',
+                                    data: {
+                                        type: 'reaction',
+                                        conversationId: msg.conversation_id,
+                                        messageId: id,
+                                        emoji,
+                                        from: auth.username,
+                                    },
+                                });
+                            }
                         }
                     }
                 }
@@ -884,8 +1206,21 @@ function registerHandlers(io) {
                 if (auth.role !== 'admin' && !(await isParticipant(auth.userId, conversationId)))
                     return;
                 await supabase_js_1.supabaseAdmin.from('messages').delete().eq('conversation_id', conversationId);
-                if (typeof to === 'string') {
-                    io.to((0, exports.USER_ROOM)(to)).emit('clear-all-messages', { from, to });
+                if (await conversationIsGroup(conversationId)) {
+                    const targets = await activeGroupUsernames(conversationId);
+                    targets.forEach((uname) => io.to((0, exports.USER_ROOM)(uname)).emit('clear-all-messages', {
+                        from,
+                        to: uname,
+                        conversationId,
+                    }));
+                }
+                else if (typeof to === 'string') {
+                    io.to((0, exports.USER_ROOM)(to)).emit('clear-all-messages', { from, to, conversationId });
+                    io.to((0, exports.USER_ROOM)(auth.username)).emit('clear-all-messages', {
+                        from,
+                        to: auth.username,
+                        conversationId,
+                    });
                 }
             }
             catch (e) {

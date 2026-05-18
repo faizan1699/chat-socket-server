@@ -1,12 +1,8 @@
-/**
- * Socket.IO event handlers for NexChat. Ported from the original
- * Next.js pages/api/socket.ts so behaviour stays identical — only the
- * runtime/transport changed (Vercel serverless → standalone Node).
- */
 import type { Server as ServerIO, Socket } from 'socket.io';
 import { authenticateSocket, socketRateLimit, type SocketAuth } from './auth.js';
 import { supabaseAdmin } from './supabase.js';
 import { pushToUser } from './push.js';
+import { sendWebPushToUser } from './web-push.js';
 
 function previewForMessage(data: any): string {
   if (data?.isVoiceMessage) return '🎤 Voice message';
@@ -691,20 +687,38 @@ export function registerHandlers(io: ServerIO) {
             .eq('username', String(payload.to).trim())
             .maybeSingle();
           if (!callee?.id) return;
-          await pushToUser(callee.id, {
-            title: `Incoming ${callType === 'video' ? 'video' : 'voice'} call`,
-            body: payload.from,
-            sound: 'default',
-            channelId: 'calls',
-            priority: 'high',
-            ttl: 30,
-            data: {
-              type: 'call',
-              callType,
-              from: payload.from,
-              to: payload.to,
-            },
-          });
+          // Fan out to BOTH transports — native (Expo) and browser PWA
+          // (Web Push). If the user is on multiple device classes (e.g.
+          // phone + laptop PWA), each picks up the appropriate ring.
+          await Promise.all([
+            pushToUser(callee.id, {
+              title: `Incoming ${callType === 'video' ? 'video' : 'voice'} call`,
+              body: payload.from,
+              sound: 'default',
+              channelId: 'calls',
+              priority: 'high',
+              ttl: 30,
+              data: {
+                type: 'call',
+                callType,
+                from: payload.from,
+                to: payload.to,
+              },
+            }),
+            sendWebPushToUser(callee.id, {
+              kind: 'call-incoming',
+              title: `Incoming ${callType === 'video' ? 'video' : 'voice'} call`,
+              body: `${payload.from} is calling…`,
+              tag: `call-incoming:${payload.from}`,
+              requireInteraction: true,
+              ttl: 30,
+              data: {
+                peer: payload.from,
+                callType,
+                conversationId: (payload as { conversationId?: string }).conversationId ?? null,
+              },
+            }),
+          ]);
         } catch (e) {
           console.error('[socket] call push failed:', e);
         }
