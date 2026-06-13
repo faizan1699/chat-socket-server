@@ -96,11 +96,35 @@ async function usernameForId(userId: string): Promise<string | null> {
 async function activeGroupUsernames(conversationId: string): Promise<string[]> {
   const { data: parts } = await supabaseAdmin
     .from('conversation_participants')
-    .select('left_at, users:users(username)')
-    .eq('conversation_id', conversationId);
-  return (parts || [])
-    .filter((p: any) => !p.left_at && p.users?.username)
-    .map((p: any) => p.users.username as string);
+    .select('user_id, left_at')
+    .eq('conversation_id', conversationId)
+    .is('left_at', null);
+  const ids = (parts || []).map((p: any) => p.user_id).filter(Boolean);
+  if (!ids.length) return [];
+  const { data: users } = await supabaseAdmin
+    .from('users')
+    .select('username')
+    .in('id', ids);
+  return (users || []).map((u: any) => u.username as string).filter(Boolean);
+}
+
+async function activeGroupParticipants(
+  conversationId: string,
+): Promise<Array<{ id: string; username: string }>> {
+  const { data: parts } = await supabaseAdmin
+    .from('conversation_participants')
+    .select('user_id, left_at')
+    .eq('conversation_id', conversationId)
+    .is('left_at', null);
+  const ids = (parts || []).map((p: any) => p.user_id).filter(Boolean);
+  if (!ids.length) return [];
+  const { data: users } = await supabaseAdmin
+    .from('users')
+    .select('id, username')
+    .in('id', ids);
+  return (users || [])
+    .filter((u: any) => u?.id && u?.username)
+    .map((u: any) => ({ id: u.id as string, username: u.username as string }));
 }
 
 async function conversationIsGroup(conversationId: string): Promise<boolean> {
@@ -527,13 +551,8 @@ export function registerHandlers(io: ServerIO) {
 
         const enriched = { ...data, conversation_id: convId, conversationId: convId };
 
-        const { data: convParticipants } = await supabaseAdmin
-          .from('conversation_participants')
-          .select('user_id, left_at, users:users(id, username)')
-          .eq('conversation_id', convId);
-        const activeUsernames = (convParticipants || [])
-          .filter((p: any) => !p.left_at && p.users?.username)
-          .map((p: any) => p.users.username as string);
+        const activeParticipants = await activeGroupParticipants(convId);
+        const activeUsernames = activeParticipants.map((p) => p.username);
 
         if (createdNew) {
           const convPayload = await buildConversationPayload(convId);
@@ -575,6 +594,48 @@ export function registerHandlers(io: ServerIO) {
               messageId: id,
               from: cleanFrom,
             },
+          });
+        }
+
+        if (convRow?.is_group) {
+          const { data: groupConv } = await supabaseAdmin
+            .from('conversations')
+            .select('name')
+            .eq('id', convId)
+            .maybeSingle();
+          const groupName = (groupConv?.name as string) || 'Group chat';
+          const pushBody = `${cleanFrom}: ${previewForMessage(data)}`;
+          const pushTag = `message:${convId}`;
+          const recipients = activeParticipants.filter(
+            (p) => p.username !== cleanFrom && !isUserConnected(p.username),
+          );
+          recipients.forEach((p) => {
+            void pushToUser(p.id, {
+              title: groupName,
+              body: pushBody,
+              sound: 'default',
+              channelId: 'default',
+              priority: 'high',
+              data: {
+                type: 'message',
+                conversationId: convId,
+                messageId: id,
+                from: cleanFrom,
+                isGroup: true,
+              },
+            });
+            void sendWebPushToUser(p.id, {
+              kind: 'message',
+              title: groupName,
+              body: pushBody,
+              tag: pushTag,
+              data: {
+                conversationId: convId,
+                messageId: id,
+                from: cleanFrom,
+                isGroup: true,
+              },
+            });
           });
         }
 
@@ -810,13 +871,8 @@ export function registerHandlers(io: ServerIO) {
             .eq('id', convId)
             .maybeSingle();
           if (conv?.is_group) {
-            const { data: parts } = await supabaseAdmin
-              .from('conversation_participants')
-              .select('left_at, users:users(username)')
-              .eq('conversation_id', convId);
-            const targets = (parts || [])
-              .filter((p: any) => !p.left_at && p.users?.username && p.users.username !== payload.from)
-              .map((p: any) => p.users.username as string);
+            const allUsernames = await activeGroupUsernames(convId);
+            const targets = allUsernames.filter((uname) => uname !== payload.from);
             targets.forEach((uname) => {
               io.to(USER_ROOM(uname)).emit('typing', {
                 from: payload.from,
