@@ -183,6 +183,89 @@ async function computeAndApplyAggregate(
   return { status: next, changed: true };
 }
 
+async function deliverPendingForUser(
+  io: ServerIO,
+  username: string,
+  userId: string,
+): Promise<void> {
+  try {
+    const { data: parts } = await supabaseAdmin
+      .from('conversation_participants')
+      .select('conversation_id')
+      .eq('user_id', userId)
+      .is('left_at', null);
+    const convIds = (parts || []).map((p: any) => p.conversation_id);
+    if (!convIds.length) return;
+
+    const { data: pending } = await supabaseAdmin
+      .from('messages')
+      .select('id, conversation_id, sender_id')
+      .in('conversation_id', convIds)
+      .neq('sender_id', userId)
+      .eq('status', 'sent')
+      .order('timestamp', { ascending: false })
+      .limit(500);
+    if (!pending || !pending.length) return;
+
+    const uniqueConvIds = Array.from(new Set(pending.map((m: any) => m.conversation_id)));
+    const { data: convs } = await supabaseAdmin
+      .from('conversations')
+      .select('id, is_group')
+      .in('id', uniqueConvIds);
+    const groupSet = new Set(
+      (convs || []).filter((c: any) => c.is_group).map((c: any) => c.id),
+    );
+
+    const now = new Date().toISOString();
+    const direct = pending.filter((m: any) => !groupSet.has(m.conversation_id));
+    const group = pending.filter((m: any) => groupSet.has(m.conversation_id));
+
+    if (direct.length) {
+      const ids = direct.map((m: any) => m.id);
+      await supabaseAdmin.from('messages').update({ status: 'delivered' }).in('id', ids);
+      await supabaseAdmin.from('message_receipts').upsert(
+        direct.map((m: any) => ({ message_id: m.id, user_id: userId, delivered_at: now })),
+        { onConflict: 'message_id,user_id', ignoreDuplicates: true },
+      );
+      const bySender = new Map<string, string[]>();
+      direct.forEach((m: any) => {
+        const arr = bySender.get(m.sender_id) || [];
+        arr.push(m.id);
+        bySender.set(m.sender_id, arr);
+      });
+      for (const [senderId, msgIds] of bySender) {
+        const senderUsername = await usernameForId(senderId);
+        if (!senderUsername) continue;
+        msgIds.forEach((mid) => {
+          io.to(USER_ROOM(senderUsername)).emit('message-status-update', {
+            messageId: mid,
+            status: 'delivered',
+          });
+        });
+      }
+    }
+
+    for (const m of group) {
+      await supabaseAdmin.from('message_receipts').upsert(
+        { message_id: m.id, user_id: userId, delivered_at: now },
+        { onConflict: 'message_id,user_id', ignoreDuplicates: false },
+      );
+      const next = await computeAndApplyAggregate(m.id);
+      if (next?.changed) {
+        const senderUsername = await usernameForId(m.sender_id);
+        if (senderUsername) {
+          io.to(USER_ROOM(senderUsername)).emit('message-status-update', {
+            messageId: m.id,
+            status: next.status,
+          });
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[socket] deliverPendingForUser failed:', e);
+  }
+}
+
 async function isParticipant(userId: string, conversationId: string): Promise<boolean> {
   const { data } = await supabaseAdmin
     .from('conversation_participants')
@@ -357,7 +440,7 @@ export function registerHandlers(io: ServerIO) {
         const hasCookie = !!socket.handshake.headers.cookie;
         console.warn(
           `[socket] auth rejected from ${socket.handshake.address} ` +
-            `(authToken=${hasAuthToken} header=${hasAuthHeader} cookie=${hasCookie})`,
+          `(authToken=${hasAuthToken} header=${hasAuthHeader} cookie=${hasCookie})`,
         );
         return next(new Error('UNAUTHORIZED'));
       }
@@ -386,10 +469,12 @@ export function registerHandlers(io: ServerIO) {
     userOnline(auth.username);
     io.emit('joined', onlineMapForClient());
     console.log(`[socket] connect ${auth.username} (${socket.id}) online=${onlineUsers.size}`);
+    void deliverPendingForUser(io, auth.username, auth.userId);
 
     socket.on('join-user', () => {
       socket.join(USER_ROOM(auth.username));
       io.emit('joined', onlineMapForClient());
+      void deliverPendingForUser(io, auth.username, auth.userId);
     });
 
     socket.on('disconnect', (reason) => {
