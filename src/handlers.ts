@@ -1140,6 +1140,35 @@ export function registerHandlers(io: ServerIO) {
       }
     });
 
+    socket.on('view-once-opened', async ({ id, to }) => {
+      if (!limit(socket, 'view-once-opened', 30, 10_000)) return;
+      if (typeof id !== 'string' || !id) return;
+      try {
+        const { data: msg } = await supabaseAdmin
+          .from('messages')
+          .select('conversation_id')
+          .eq('id', id)
+          .maybeSingle();
+        if (!msg) return;
+        if (auth.role !== 'admin' && !(await isParticipant(auth.userId, msg.conversation_id))) return;
+
+        if (await conversationIsGroup(msg.conversation_id)) {
+          const targets = await activeGroupUsernames(msg.conversation_id);
+          targets.forEach((uname) =>
+            io.to(USER_ROOM(uname)).emit('view-once-opened', {
+              id,
+              conversationId: msg.conversation_id,
+            }),
+          );
+        } else if (typeof to === 'string') {
+          io.to(USER_ROOM(to)).emit('view-once-opened', { id });
+          io.to(USER_ROOM(auth.username)).emit('view-once-opened', { id });
+        }
+      } catch (e) {
+        console.error('[socket] view-once-opened failed:', e);
+      }
+    });
+
     socket.on('react-message', async ({ id, emoji, to }) => {
       if (!limit(socket, 'react-message', 60, 10_000)) return;
       if (typeof id !== 'string' || !id) return;
