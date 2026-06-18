@@ -199,7 +199,9 @@ async function deliverPendingForUser(
 
     const { data: pending } = await supabaseAdmin
       .from('messages')
-      .select('id, conversation_id, sender_id')
+      .select(
+        'id, conversation_id, sender_id, content, timestamp, is_voice_message, audio_url, audio_duration, file, reply_to, is_edited, is_deleted, is_pinned',
+      )
       .in('conversation_id', convIds)
       .neq('sender_id', userId)
       .eq('status', 'sent')
@@ -215,6 +217,18 @@ async function deliverPendingForUser(
     const groupSet = new Set(
       (convs || []).filter((c: any) => c.is_group).map((c: any) => c.id),
     );
+
+    const senderIds = Array.from(new Set(pending.map((m: any) => m.sender_id).filter(Boolean)));
+    const senderUsernames = new Map<string, string>();
+    if (senderIds.length) {
+      const { data: senders } = await supabaseAdmin
+        .from('users')
+        .select('id, username')
+        .in('id', senderIds);
+      (senders || []).forEach((u: any) => {
+        if (u?.id && u?.username) senderUsernames.set(u.id, u.username);
+      });
+    }
 
     const now = new Date().toISOString();
     const direct = pending.filter((m: any) => !groupSet.has(m.conversation_id));
@@ -260,6 +274,35 @@ async function deliverPendingForUser(
           });
         }
       }
+    }
+
+    const ordered = [...pending].sort(
+      (a: any, b: any) =>
+        new Date(a.timestamp || 0).getTime() - new Date(b.timestamp || 0).getTime(),
+    );
+    for (const m of ordered) {
+      const senderUsername = senderUsernames.get(m.sender_id);
+      if (!senderUsername) continue;
+      const isGroup = groupSet.has(m.conversation_id);
+      io.to(USER_ROOM(username)).emit('receive-message', {
+        id: m.id,
+        from: senderUsername,
+        to: isGroup ? '' : username,
+        message: m.content || previewForStoredMessage(m),
+        content: m.content || '',
+        conversation_id: m.conversation_id,
+        conversationId: m.conversation_id,
+        timestamp: m.timestamp,
+        status: 'delivered',
+        isVoiceMessage: !!m.is_voice_message,
+        audioUrl: m.audio_url || undefined,
+        audioDuration: m.audio_duration ?? undefined,
+        file: m.file || undefined,
+        replyTo: m.reply_to || undefined,
+        isEdited: !!m.is_edited,
+        isDeleted: !!m.is_deleted,
+        isPinned: !!m.is_pinned,
+      });
     }
   } catch (e) {
     console.error('[socket] deliverPendingForUser failed:', e);
@@ -667,14 +710,26 @@ export function registerHandlers(io: ServerIO) {
         }
 
         if (!convRow?.is_group && toUser && !recipientOnline && cleanFrom !== cleanTo) {
+          const directPreview = previewForMessage(data);
           void pushToUser(toUser.id, {
             title: cleanFrom,
-            body: previewForMessage(data),
+            body: directPreview,
             sound: 'default',
             channelId: 'default',
             priority: 'high',
             data: {
               type: 'message',
+              conversationId: convId,
+              messageId: id,
+              from: cleanFrom,
+            },
+          });
+          void sendWebPushToUser(toUser.id, {
+            kind: 'message',
+            title: cleanFrom,
+            body: directPreview,
+            tag: `message:${convId}`,
+            data: {
               conversationId: convId,
               messageId: id,
               from: cleanFrom,
