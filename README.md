@@ -11,7 +11,7 @@ Recommended hosts: **Railway**, **Fly.io**, **Render**, **DigitalOcean App Platf
 1. **Create a new Railway service** from this monorepo.
 2. **Set the Root Directory** in service settings to `socket-server`.
 3. **Set environment variables** (see `.env.example`):
-   - `JWT_SECRET` — must match the Next.js app exactly
+   - `JWT_SECRET` — must match the Next.js app
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_ROLE_KEY`
    - `INTERNAL_API_SECRET` — generate a long random string, MUST match the Next.js app
