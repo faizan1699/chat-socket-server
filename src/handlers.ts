@@ -1006,6 +1006,55 @@ export function registerHandlers(io: ServerIO) {
       if (payload?.to) io.to(USER_ROOM(payload.to)).emit('mute-status', payload);
     });
 
+    socket.on('rc:request', (payload) => {
+      if (!limit(socket, 'rc:request', 10, 60_000)) return;
+      if (!isSenderValid(socket, payload?.from) || !payload?.to) return;
+      io.to(USER_ROOM(payload.to)).emit('rc:request', {
+        from: payload.from,
+        to: payload.to,
+        mode: payload?.mode === 'view' ? 'view' : 'control',
+      });
+    });
+
+    socket.on('rc:accept', (payload) => {
+      if (!isSenderValid(socket, payload?.from) || !payload?.to) return;
+      io.to(USER_ROOM(payload.to)).emit('rc:accept', {
+        from: payload.from,
+        to: payload.to,
+        mode: payload?.mode === 'view' ? 'view' : 'control',
+      });
+    });
+
+    socket.on('rc:deny', (payload) => {
+      if (!isSenderValid(socket, payload?.from) || !payload?.to) return;
+      io.to(USER_ROOM(payload.to)).emit('rc:deny', {
+        from: payload.from,
+        to: payload.to,
+        reason: typeof payload?.reason === 'string' ? payload.reason.slice(0, 120) : null,
+      });
+    });
+
+    socket.on('rc:offer', (payload) => {
+      if (!isSenderValid(socket, payload?.from) || !payload?.to) return;
+      io.to(USER_ROOM(payload.to)).emit('rc:offer', payload);
+    });
+
+    socket.on('rc:answer', (payload) => {
+      if (!isSenderValid(socket, payload?.from) || !payload?.to) return;
+      io.to(USER_ROOM(payload.to)).emit('rc:answer', payload);
+    });
+
+    socket.on('rc:ice', (payload) => {
+      if (!limit(socket, 'rc:ice', 400, 10_000)) return;
+      if (!payload?.to) return;
+      io.to(USER_ROOM(payload.to)).emit('rc:ice', payload);
+    });
+
+    socket.on('rc:stop', (payload) => {
+      if (!isSenderValid(socket, payload?.from) || !payload?.to) return;
+      io.to(USER_ROOM(payload.to)).emit('rc:stop', { from: payload.from, to: payload.to });
+    });
+
     socket.on('typing', async (payload) => {
       if (!limit(socket, 'typing', 60, 10_000)) return;
       if (!payload?.from) return;
