@@ -16,6 +16,7 @@ export const env = {
   supabaseUrl: required('SUPABASE_URL'),
   supabaseServiceKey: required('SUPABASE_SERVICE_ROLE_KEY'),
   internalSecret: required('INTERNAL_API_SECRET'),
+  redisUrl: optional('REDIS_URL'),
   allowedOrigins: optional('ALLOWED_ORIGINS')
     .split(',')
     .map((s) => s.trim())

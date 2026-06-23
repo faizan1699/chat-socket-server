@@ -1,6 +1,7 @@
 import type { Server as ServerIO, Socket } from 'socket.io';
 import { authenticateSocket, socketRateLimit, type SocketAuth } from './auth.js';
 import { supabaseAdmin } from './supabase.js';
+import { invalidateConversation } from './cache.js';
 import { pushToUser } from './push.js';
 import { sendWebPushToUser } from './web-push.js';
 
@@ -681,6 +682,8 @@ export function registerHandlers(io: ServerIO) {
 
         const activeParticipants = await activeGroupParticipants(convId);
         const activeUsernames = activeParticipants.map((p) => p.username);
+
+        void invalidateConversation(convId, activeParticipants.map((p) => p.id));
 
         if (createdNew) {
           const convPayload = await buildConversationPayload(convId);
@@ -1454,6 +1457,8 @@ export function registerHandlers(io: ServerIO) {
         if (auth.role !== 'admin' && !(await isParticipant(auth.userId, conversationId))) return;
 
         await supabaseAdmin.from('messages').delete().eq('conversation_id', conversationId);
+
+        void invalidateConversation(conversationId);
 
         if (await conversationIsGroup(conversationId)) {
           const targets = await activeGroupUsernames(conversationId);
