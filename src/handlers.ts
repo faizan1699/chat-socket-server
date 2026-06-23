@@ -877,6 +877,16 @@ export function registerHandlers(io: ServerIO) {
     socket.on('offer', (payload) => {
       if (!limit(socket, 'offer', 30, 10_000)) return;
       if (!isSenderValid(socket, payload?.from) || !payload?.to) return;
+
+      const calleeBusyWith = activeCalls.get(payload.to);
+      if (calleeBusyWith && calleeBusyWith !== payload.from) {
+        io.to(USER_ROOM(payload.from)).emit('call-busy', {
+          from: payload.to,
+          to: payload.from,
+        });
+        return;
+      }
+
       activeCalls.set(payload.from, payload.to);
       activeCalls.set(payload.to, payload.from);
       io.to(USER_ROOM(payload.to)).emit('offer', payload);
